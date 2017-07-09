@@ -41,6 +41,12 @@
 
 #define SAFE_DELETE(p)       do { delete (p);     (p)=NULL; } while (0)
 
+static const AP4_Track::Type TIDC[adaptive::AdaptiveTree::STREAM_TYPE_COUNT] = {
+  AP4_Track::TYPE_UNKNOWN,
+  AP4_Track::TYPE_VIDEO,
+  AP4_Track::TYPE_AUDIO,
+  AP4_Track::TYPE_SUBTITLES };
+
 /*******************************************************
 kodi host - interface for decrypter libraries
 ********************************************************/
@@ -392,7 +398,7 @@ public:
   virtual bool GetVideoInformation(INPUTSTREAM_INFO &info){ return false; };
   virtual bool GetAudioInformation(unsigned int &channels){ return false; };
   virtual bool ExtraDataToAnnexB() { return false; };
-  virtual kodi::addon::CODEC_PROFILE GetProfile() { return kodi::addon::CODEC_PROFILE::CodecProfileNotNeeded; };
+  virtual STREAMCODEC_PROFILE GetProfile() { return STREAMCODEC_PROFILE::CodecProfileNotNeeded; };
   virtual bool Transform(AP4_DataBuffer &buf, AP4_UI64 timescale) { return false; };
   virtual bool ReadNextSample(AP4_Sample &sample, AP4_DataBuffer &buf) { return false; };
   virtual bool TimeSeek(AP4_UI64 seekPos) { return true; };
@@ -428,28 +434,28 @@ public:
       switch (avc->GetProfile())
       {
       case AP4_AVC_PROFILE_BASELINE:
-        codecProfile = kodi::addon::CODEC_PROFILE::H264CodecProfileBaseline;
+        codecProfile = STREAMCODEC_PROFILE::H264CodecProfileBaseline;
         break;
       case AP4_AVC_PROFILE_MAIN:
-        codecProfile = kodi::addon::CODEC_PROFILE::H264CodecProfileMain;
+        codecProfile = STREAMCODEC_PROFILE::H264CodecProfileMain;
         break;
       case AP4_AVC_PROFILE_EXTENDED:
-        codecProfile = kodi::addon::CODEC_PROFILE::H264CodecProfileExtended;
+        codecProfile = STREAMCODEC_PROFILE::H264CodecProfileExtended;
         break;
       case AP4_AVC_PROFILE_HIGH:
-        codecProfile = kodi::addon::CODEC_PROFILE::H264CodecProfileHigh;
+        codecProfile = STREAMCODEC_PROFILE::H264CodecProfileHigh;
         break;
       case AP4_AVC_PROFILE_HIGH_10:
-        codecProfile = kodi::addon::CODEC_PROFILE::H264CodecProfileHigh10;
+        codecProfile = STREAMCODEC_PROFILE::H264CodecProfileHigh10;
         break;
       case AP4_AVC_PROFILE_HIGH_422:
-        codecProfile = kodi::addon::CODEC_PROFILE::H264CodecProfileHigh422;
+        codecProfile = STREAMCODEC_PROFILE::H264CodecProfileHigh422;
         break;
       case AP4_AVC_PROFILE_HIGH_444:
-        codecProfile = kodi::addon::CODEC_PROFILE::H264CodecProfileHigh444Predictive;
+        codecProfile = STREAMCODEC_PROFILE::H264CodecProfileHigh444Predictive;
         break;
       default:
-        codecProfile = kodi::addon::CODEC_PROFILE::CodecProfileUnknown;
+        codecProfile = STREAMCODEC_PROFILE::CodecProfileUnknown;
         break;
       }
     }
@@ -575,13 +581,13 @@ public:
     return false;
   };
 
-  virtual kodi::addon::CODEC_PROFILE GetProfile()
+  virtual STREAMCODEC_PROFILE GetProfile() override
   {
     return codecProfile;
   };
 private:
   unsigned int countPictureSetIds;
-  kodi::addon::CODEC_PROFILE codecProfile;
+  STREAMCODEC_PROFILE codecProfile;
   bool needSliceInfo;
 };
 
@@ -634,12 +640,12 @@ public:
     :CodecHandler(sd)
   {};
 
-  bool Transform(AP4_DataBuffer &buf, AP4_UI64 timescale) override
+  virtual bool Transform(AP4_DataBuffer &buf, AP4_UI64 timescale) override
   {
     return m_ttml.Parse(buf.GetData(), buf.GetDataSize(), timescale);
   }
 
-  bool ReadNextSample(AP4_Sample &sample, AP4_DataBuffer &buf)
+  virtual bool ReadNextSample(AP4_Sample &sample, AP4_DataBuffer &buf) override
   {
     uint64_t pts;
     uint32_t dur;
@@ -673,6 +679,7 @@ private:
 class SampleReader
 {
 public:
+  virtual ~SampleReader() = default;
   virtual bool EOS()const = 0;
   virtual double DTS()const = 0;
   virtual double PTS()const = 0;
@@ -902,7 +909,7 @@ public:
 protected:
   virtual AP4_Result ProcessMoof(AP4_ContainerAtom* moof,
     AP4_Position       moof_offset,
-    AP4_Position       mdat_payload_offset)
+    AP4_Position       mdat_payload_offset) override
   {
     AP4_Result result;
 
@@ -1442,7 +1449,27 @@ bool Session::initialize()
             {
               init_data.AppendData(pssh[i]->GetData().GetData(), pssh[i]->GetData().GetDataSize());
               if (adaptiveTree_->psshSets_[ses].defaultKID_.empty())
-                adaptiveTree_->psshSets_[ses].defaultKID_ = std::string((const char*)pssh[i]->GetKid(0), 16);
+              {
+                if (pssh[i]->GetKid(0))
+                  adaptiveTree_->psshSets_[ses].defaultKID_ = std::string((const char*)pssh[i]->GetKid(0), 16);
+                else if (AP4_Track *track = movie->GetTrack(TIDC[stream.stream_.get_type()]))
+                {
+                  AP4_ProtectedSampleDescription *m_protectedDesc = static_cast<AP4_ProtectedSampleDescription*>(track->GetSampleDescription(0));
+                  AP4_ContainerAtom *schi;
+                  if (m_protectedDesc->GetSchemeInfo() && (schi = m_protectedDesc->GetSchemeInfo()->GetSchiAtom()))
+                  {
+                    AP4_TencAtom* tenc(AP4_DYNAMIC_CAST(AP4_TencAtom, schi->GetChild(AP4_ATOM_TYPE_TENC, 0)));
+                    if (tenc)
+                      adaptiveTree_->psshSets_[ses].defaultKID_ = std::string((const char*)tenc->GetDefaultKid());
+                    else
+                    {
+                      AP4_PiffTrackEncryptionAtom* piff(AP4_DYNAMIC_CAST(AP4_PiffTrackEncryptionAtom, schi->GetChild(AP4_UUID_PIFF_TRACK_ENCRYPTION_ATOM, 0)));
+                      if (piff)
+                        adaptiveTree_->psshSets_[ses].defaultKID_ = std::string((const char*)piff->GetDefaultKid());
+                    }
+                  }
+                }
+              }
             }
           }
 
@@ -1728,9 +1755,12 @@ std::uint16_t Session::GetVideoWidth() const
   switch (secure_video_session_ ? max_secure_resolution_ : max_resolution_)
   {
   case 1:
-    if (ret > 1280) ret = 1280;
+    if (ret > 640) ret = 640;
     break;
   case 2:
+    if (ret > 1280) ret = 1280;
+    break;
+  case 3:
     if (ret > 1920) ret = 1920;
     break;
   default:
@@ -1745,9 +1775,12 @@ std::uint16_t Session::GetVideoHeight() const
   switch (secure_video_session_ ? max_secure_resolution_ : max_resolution_)
   {
   case 1:
-    if (ret > 720) ret = 720;
+    if (ret > 480) ret = 480;
     break;
   case 2:
+    if (ret > 720) ret = 720;
+    break;
+  case 3:
     if (ret > 1080) ret = 1080;
     break;
   default:
@@ -1956,20 +1989,20 @@ struct INPUTSTREAM_IDS CInputStreamAdaptive::GetStreamIds()
 void CInputStreamAdaptive::GetCapabilities(INPUTSTREAM_CAPABILITIES &caps)
 {
   kodi::Log(ADDON_LOG_DEBUG, "GetCapabilities()");
-  caps.m_mask = INPUTSTREAM_CAPABILITIES::SUPPORTSIDEMUX |
-    INPUTSTREAM_CAPABILITIES::SUPPORTSIDISPLAYTIME;
+  caps.m_mask = INPUTSTREAM_CAPABILITIES::SUPPORTS_IDEMUX |
+    INPUTSTREAM_CAPABILITIES::SUPPORTS_IDISPLAYTIME;
   if (m_session && !m_session->IsLive())
-    caps.m_mask |= INPUTSTREAM_CAPABILITIES::SUPPORTSSEEK
-    | INPUTSTREAM_CAPABILITIES::SUPPORTSPAUSE;
+    caps.m_mask |= INPUTSTREAM_CAPABILITIES::SUPPORTS_SEEK
+    | INPUTSTREAM_CAPABILITIES::SUPPORTS_PAUSE;
 }
 
 struct INPUTSTREAM_INFO CInputStreamAdaptive::GetStream(int streamid)
 {
   static struct INPUTSTREAM_INFO dummy_info = {
-    INPUTSTREAM_INFO::TYPE_NONE, 0, "", "", kodi::addon::CODEC_PROFILE::CodecProfileUnknown, 0, 0, 0, "",
+    INPUTSTREAM_INFO::TYPE_NONE, 0, "", "", STREAMCODEC_PROFILE::CodecProfileUnknown, 0, 0, 0, "",
     0, 0, 0, 0, 0.0f,
     0, 0, 0, 0, 0,
-    CRYPTO_INFO::CRYPTO_KEY_SYSTEM_NONE ,0 ,0};
+    CRYPTO_INFO::CRYPTO_KEY_SYSTEM_NONE ,0 ,0 ,0};
 
   kodi::Log(ADDON_LOG_DEBUG, "GetStream(%d)", streamid);
 
@@ -1989,6 +2022,10 @@ struct INPUTSTREAM_INFO CInputStreamAdaptive::GetStream(int streamid)
 
       if(m_session->GetDecrypterCaps(cdmId).flags & SSD::SSD_DECRYPTER::SSD_CAPS::SSD_SUPPORTS_DECODING)
         stream->info_.m_features = INPUTSTREAM_INFO::FEATURE_DECODE;
+      else
+       stream->info_.m_features = 0;
+
+      stream->info_.m_cryptoInfo.flags = (m_session->GetDecrypterCaps(cdmId).flags & SSD::SSD_DECRYPTER::SSD_CAPS::SSD_SECURE_DECODER) ? CRYPTO_INFO::FLAG_SECURE_DECODER : 0;
     }
     return stream->info_;
   }
@@ -2039,12 +2076,6 @@ void CInputStreamAdaptive::EnableStream(int streamid, bool enable)
 
     stream->input_ = new AP4_DASHStream(&stream->stream_);
     AP4_Movie* movie(0);
-    static const AP4_Track::Type TIDC[adaptive::AdaptiveTree::STREAM_TYPE_COUNT] = { 
-      AP4_Track::TYPE_UNKNOWN,
-      AP4_Track::TYPE_VIDEO,
-      AP4_Track::TYPE_AUDIO,
-      AP4_Track::TYPE_SUBTITLES };
-
     if (m_session->GetManifestType() == MANIFEST_TYPE_ISM && stream->stream_.getRepresentation()->get_initialization() == nullptr)
     {
       //We'll create a Movie out of the things we got from manifest file
